@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Compact identification of any file + recommended next command (never executes the target).
+# usage: re-triage <file>
+[ $# -ge 1 ] || { echo "usage: re-triage <file>"; exit 2; }
+exec "${RE_HOME:-/opt/re}/venv/bin/python" -I "$(dirname "$(readlink -f "$0")")/../tools/triage.py" "$(realpath "$1")"

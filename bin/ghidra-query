@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Query an already-analyzed program (from ghidra-analyze) without re-analysis. Prints to stdout.
+# usage: ghidra-query <ghidra-outdir|binary> <mode> <target>...
+#   modes: decomp <func|addr>...   disasm <func|addr>...   xrefs <func|sym|addr>
+#          callees <func|addr>     rename <func|addr> <newname>  (persists; later decomp shows new name)
+#   <ghidra-outdir> is the -o dir of ghidra-analyze (default ./work/<name>/ghidra); a binary path maps to that default.
+set -euo pipefail
+RE_HOME=${RE_HOME:-/opt/re}
+GH=$RE_HOME/ghidra
+SCRIPTS=$(cd "$(dirname "$(readlink -f "$0")")/../tools/ghidra_scripts" && pwd)
+[ $# -ge 3 ] || { sed -n '2,6p' "$0"; exit 2; }
+D=$1; shift
+if [ -f "$D" ]; then D=./work/$(basename "$D")/ghidra; fi
+D=$(realpath -m "$D")
+[ -f "$D/project/.program" ] || { echo "no analyzed project in $D (run ghidra-analyze first)" >&2; exit 1; }
+PROG=$(cat "$D/project/.program")
+MODE=$1
+RO=(-readOnly); [ "$MODE" = rename ] && RO=()
+TMP=$(mktemp)
+"$GH/support/analyzeHeadless" "$D/project" proj -process "$PROG" -noanalysis "${RO[@]}" \
+  -scriptPath "$SCRIPTS" -postScript Query.java "$TMP" "$@" >"$D/query.log" 2>&1 \
+  || { echo "analyzeHeadless failed; see $D/query.log" >&2; tail -20 "$D/query.log" >&2; exit 1; }
+if [ ! -s "$TMP" ]; then echo "no output; errors:" >&2; grep -E "ERROR|Exception" "$D/query.log" | head >&2; fi
+cat "$TMP"; rm -f "$TMP"

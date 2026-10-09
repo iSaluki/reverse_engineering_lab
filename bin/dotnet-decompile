@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Decompile a .NET assembly (exe/dll, incl. Unity Assembly-CSharp.dll) to a C# project with ILSpy.
+# usage: dotnet-decompile <assembly> [-o OUTDIR] [--il]
+# OUTDIR (default ./work/<name>/dotnet): src/ (C# project, one file per type), types.txt, il/ (with --il)
+# Tips: grep -rn "Password\|Decrypt\|HttpClient" OUTDIR/src ; obfuscated names (e.g. ConfuserEx) still decompile.
+set -euo pipefail
+[ $# -ge 1 ] || { sed -n '2,5p' "$0"; exit 2; }
+IN=$(realpath "$1"); shift; NAME=$(basename "$IN"); OUT=""; IL=0
+while [ $# -gt 0 ]; do case "$1" in -o) OUT=$2; shift ;; --il) IL=1 ;; *) echo "bad arg $1"; exit 2 ;; esac; shift; done
+OUT=$(realpath -m "${OUT:-./work/$NAME/dotnet}"); mkdir -p "$OUT"
+echo "[dotnet-decompile] $NAME -> $OUT" >&2
+ilspycmd -l cisde "$IN" > "$OUT/types.txt" 2>"$OUT/ilspy.log" || true
+ilspycmd -p --nested-directories -o "$OUT/src" "$IN" >>"$OUT/ilspy.log" 2>&1 \
+  || { echo "ilspycmd failed (not a managed assembly? single-file bundle? see ilspy.log)" >&2; tail -5 "$OUT/ilspy.log" >&2; exit 1; }
+[ $IL -eq 1 ] && { mkdir -p "$OUT/il"; ilspycmd -il -o "$OUT/il" "$IN" >>"$OUT/ilspy.log" 2>&1 || true; }
+echo "types: $(wc -l < "$OUT/types.txt")  cs files: $(find "$OUT/src" -name '*.cs' | wc -l)"
+echo "namespaces:"; find "$OUT/src" -mindepth 1 -maxdepth 3 -type d | sed "s|$OUT/src/||" | grep -v '^Properties' | head -30 | sed 's/^/  /'

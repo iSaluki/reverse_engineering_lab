@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Unpack PyInstaller executables and decompile Python bytecode.
+# usage: py-unpack <pyinstaller-exe|elf|.pyc> [-o OUTDIR]
+# OUTDIR (default ./work/<name>/py): extracted/ (pyinstxtractor-ng), src/<x>.py (pycdc; falls back to
+#   decompyle3/uncompyle6 for <=3.8), src/<x>.pycdas.txt (bytecode disassembly when decompile is incomplete)
+# Only the app's own top-level modules are decompiled; libraries stay in extracted/PYZ*_extracted.
+set -euo pipefail
+RE_HOME=${RE_HOME:-/opt/re}
+[ $# -ge 1 ] || { sed -n '2,7p' "$0"; exit 2; }
+IN=$(realpath "$1"); shift; NAME=$(basename "$IN"); OUT=""
+while [ $# -gt 0 ]; do case "$1" in -o) OUT=$2; shift ;; *) echo "bad arg $1"; exit 2 ;; esac; shift; done
+OUT=$(realpath -m "${OUT:-./work/$NAME/py}"); mkdir -p "$OUT/src"
+PYCS=()
+if [[ "$IN" == *.pyc ]]; then
+  PYCS=("$IN")
+else
+  mkdir -p "$OUT/extracted"
+  ( cd "$OUT/extracted" && "$RE_HOME/venv/bin/pyinstxtractor-ng" "$IN" ) > "$OUT/extract.log" 2>&1 \
+    || { echo "pyinstxtractor-ng failed (not PyInstaller? see extract.log)" >&2; tail -5 "$OUT/extract.log" >&2; exit 1; }
+  X=$(find "$OUT/extracted" -maxdepth 1 -type d -name '*_extracted' | head -1)
+  grep -iE "python version|entry point|possible entry" "$OUT/extract.log" | sed 's/^\[[+!*]\] //' | head -8
+  # entry points = top-level .pyc that are not PyInstaller bootstrap files
+  while IFS= read -r f; do PYCS+=("$f"); done < <(find "$X" -maxdepth 1 -name '*.pyc' ! -name 'pyi_*' ! -name 'pyiboot*' ! -name '_pyi_*' ! -name 'struct.pyc' | sort)
+  echo "library modules: $(find "$X" -path '*PYZ*' -name '*.pyc' | wc -l) in $(basename "$X")/PYZ*_extracted (app packages may be there too: ls it)"
+fi
+# dis listing with the exact CPython version that produced the bytecode (most faithful for 3.9+,
+# where pycdc/decompyle3 are incomplete). uv downloads that interpreter on demand.
+dis_with_matching_python() {  # pyc out
+  local ver; ver=$(pycdas "$1" 2>/dev/null | head -1 | grep -oE 'Python [0-9]+\.[0-9]+' | awk '{print $2}')
+  [ -n "$ver" ] || return 0
+  uv run -q --no-project --python "$ver" python -I -c '
+import dis, marshal, sys
+with open(sys.argv[1], "rb") as f:
+    f.read(16)
+    dis.dis(marshal.load(f), file=sys.stdout)' "$1" > "$2" 2>/dev/null && echo "  + dis listing (CPython $ver): $(basename "$2")" || rm -f "$2"
+}
+for p in "${PYCS[@]}"; do
+  b=$(basename "$p" .pyc); dst="$OUT/src/$b.py"
+  case "$b" in pyimod0*|pyi_rth_*|pyiboot*) continue ;; esac
+  pycdc "$p" > "$dst" 2>"$OUT/src/$b.err" || true
+  if [ ! -s "$dst" ] || grep -qE "Unsupported opcode|Unsupported bytecode|Decompyle incomplete" "$dst" "$OUT/src/$b.err"; then
+    pycdas "$p" > "$OUT/src/$b.pycdas.txt" 2>/dev/null || true
+    # decompyle3 handles 3.7-3.8 well (uncompyle6 <= 3.8 too); keep only if it produced code
+    if "$RE_HOME/venv/bin/decompyle3" "$p" > "$dst.d3" 2>/dev/null && ! grep -q "Unsupported Python version" "$dst.d3" && [ "$(wc -l < "$dst.d3")" -gt 6 ]; then
+      mv "$dst.d3" "$dst"; echo "decompiled (decompyle3): src/$b.py"
+    else
+      rm -f "$dst.d3"; echo "decompiled PARTIAL (pycdc): src/$b.py  -> read src/$b.dis.txt / $b.pycdas.txt for the rest"
+    fi
+    dis_with_matching_python "$p" "$OUT/src/$b.dis.txt"
+  else
+    echo "decompiled: src/$b.py ($(wc -l < "$dst") lines)"
+  fi
+  [ -s "$OUT/src/$b.err" ] || rm -f "$OUT/src/$b.err"
+done

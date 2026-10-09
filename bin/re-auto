@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# One-shot static pipeline: triage, then run the right unpacker/decompiler for the file type.
+# usage: re-auto <file> [-o WORKDIR] [--capa] [--no-ghidra]
+# WORKDIR (default ./work/<name>) gets triage.txt + per-tool subdirs; INDEX.txt lists what was produced.
+# Native code goes to Ghidra (WORKDIR/ghidra: functions.tsv, strings.tsv, decomp/*.c; query with ghidra-query).
+set -uo pipefail
+[ $# -ge 1 ] || { sed -n '2,5p' "$0"; exit 2; }
+IN=$(realpath "$1"); shift; NAME=$(basename "$IN"); W=""; CAPA=0; GHIDRA=1
+while [ $# -gt 0 ]; do case "$1" in -o) W=$2; shift ;; --capa) CAPA=1 ;; --no-ghidra) GHIDRA=0 ;; *) echo "bad arg $1"; exit 2 ;; esac; shift; done
+W=$(realpath -m "${W:-./work/$NAME}"); mkdir -p "$W"
+say() { echo "[re-auto] $*" >&2; }
+
+re-triage "$IN" > "$W/triage.txt" 2>&1
+cat "$W/triage.txt"
+KIND=$(awk '$1=="KIND"{print $2}' "$W/triage.txt")
+say "kind=$KIND -> $W"
+
+native() {  # native <binary> [ghidra extra args...]
+  local b=$1; shift
+  [ $GHIDRA -eq 1 ] && { ghidra-analyze "$b" -o "$W/ghidra" "$@" >/dev/null && say "ghidra: $(grep -E '^(functions|main|entry):' "$W/ghidra/summary.txt" | tr '\n' ' ')"; }
+  [ $CAPA -eq 1 ] && { timeout 900 capa -q "$b" > "$W/capa.txt" 2>&1; say "capa -> capa.txt"; }
+  return 0
+}
+
+case "$KIND" in
+  native-elf|native-pe|native-macho) native "$IN" ;;
+  upx)
+    upx -d -o "$W/$NAME.unpacked" "$IN" >/dev/null 2>&1 && { say "UPX unpacked -> $NAME.unpacked"; native "$W/$NAME.unpacked"; } \
+      || { say "upx -d failed (modified UPX header?); analysing packed file"; native "$IN"; } ;;
+  go)
+    goresym -t -d -p "$IN" > "$W/goresym.json" 2>/dev/null && say "goresym -> goresym.json (jq '.UserFunctions[]|.FullName' to list app funcs)"
+    native "$IN" ;;
+  dotnet) dotnet-decompile "$IN" -o "$W/dotnet" ;;
+  apk) apk-analyze "$IN" -o "$W/apk" ;;
+  dex|jar)
+    jadx -q -j "$(nproc)" --show-bad-code -d "$W/jadx" "$IN" >"$W/jadx.log" 2>&1
+    say "jadx -> jadx/sources ($(find "$W/jadx/sources" -name '*.java' | wc -l) files)" ;;
+  pyinstaller|pyc) py-unpack "$IN" -o "$W/py" ;;
+  hermes) hbc-decompiler "$IN" "$W/decompiled.js" && say "-> decompiled.js" ;;
+  asar) asar extract "$IN" "$W/asar" && say "-> asar/ (then: webcrack <bundle.js> -o out)" ;;
+  electron) say "Electron: look for resources/app.asar next to the binary (or in the installer), then asar extract" ;;
+  wasm) wasm-decompile "$IN" -o "$W/$NAME.dcmp" && wasm2wat "$IN" -o "$W/$NAME.wat" && say "-> $NAME.dcmp / $NAME.wat" ;;
+  archive|ipa)
+    mkdir -p "$W/extracted"
+    if tar tf "$IN" >/dev/null 2>&1; then tar xf "$IN" -C "$W/extracted"; else 7z x -y -o"$W/extracted" "$IN" >/dev/null; fi \
+      && say "extracted $(find "$W/extracted" -type f | wc -l) files -> extracted/ ; next: re-triage the interesting members" \
+      && find "$W/extracted" -type f -size +1k -exec file {} + 2>/dev/null | sed "s|$W/||" | head -30 ;;
+  *) say "no automatic pipeline for '$KIND'; try: binwalk -e, strings -n8, floss, or ghidra-analyze with -processor" ;;
+esac
+
+{ echo "# outputs for $NAME"; (cd "$W" && find . -maxdepth 2 -not -path './ghidra/project*' -not -path '*/decomp/*' | sort | head -60); } > "$W/INDEX.txt"
+say "done. index: $W/INDEX.txt"

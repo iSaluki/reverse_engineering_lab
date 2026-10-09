@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Full static unpack of an Android app. usage: apk-analyze <apk|xapk|apks|aab> [-o OUTDIR] [--deobf] [--no-apktool]
+# OUTDIR (default ./work/<name>/apk):
+#   summary.txt     package, sdk, flags, permissions, exported components, deep links, native libs, frameworks
+#   jadx/sources    decompiled Java (grep here first)      jadx/resources  decoded resources + AndroidManifest.xml
+#   apktool/        smali + resources (for patching/rebuilding: apktool b apktool -o patched.apk)
+#   native/<abi>/   extracted .so files (-> ghidra-analyze)   hermes/ or js/  React Native bundle if present
+#   splits/         extracted split APKs when input is an xapk/apks bundle
+set -euo pipefail
+RE_HOME=${RE_HOME:-/opt/re}
+TOOLS=$(cd "$(dirname "$(readlink -f "$0")")/../tools" && pwd)
+[ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 2; }
+IN=$(realpath "$1"); shift
+NAME=$(basename "$IN"); OUT=""; DEOBF=(); APKTOOL=1
+while [ $# -gt 0 ]; do
+  case "$1" in -o) OUT=$2; shift ;; --deobf) DEOBF=(--deobf) ;; --no-apktool) APKTOOL=0 ;; *) echo "bad arg $1"; exit 2 ;; esac; shift
+done
+OUT=$(realpath -m "${OUT:-./work/$NAME/apk}"); mkdir -p "$OUT"
+APK=$IN
+# split bundles: pick base apk, keep the rest for reference
+if unzip -Z1 "$IN" 2>/dev/null | grep -E '\.apk$' >/dev/null; then
+  mkdir -p "$OUT/splits"; unzip -qo "$IN" '*.apk' -d "$OUT/splits"
+  APK=$(ls -S "$OUT"/splits/base.apk "$OUT"/splits/*.apk 2>/dev/null | head -1)
+  echo "[apk-analyze] bundle: using $(basename "$APK") as base; other splits in $OUT/splits" >&2
+fi
+case "$IN" in *.aab) echo "[apk-analyze] .aab: jadx reads it directly; apktool does not" >&2; APKTOOL=0 ;; esac
+
+echo "[apk-analyze] $NAME -> $OUT" >&2
+t0=$SECONDS
+( jadx -q -j "$(nproc)" --show-bad-code "${DEOBF[@]}" -d "$OUT/jadx" "$APK" >"$OUT/jadx.log" 2>&1 || true ) &
+JP=$!
+if [ $APKTOOL -eq 1 ]; then ( apktool d -f -q -o "$OUT/apktool" "$APK" >"$OUT/apktool.log" 2>&1 || echo "apktool failed (see apktool.log)" >&2 ) & fi
+AP=$!
+
+{
+  "$RE_HOME/venv/bin/python" -I "$TOOLS/apk_summary.py" "$APK" 2>/dev/null || aapt dump badging "$APK" 2>/dev/null | head -20
+  "$RE_HOME/venv/bin/python" -I "$TOOLS/triage.py" "$APK" | grep -E '^(framework|sha256)' || true
+} > "$OUT/summary.txt"
+
+# native libs
+if unzip -Z1 "$APK" | grep -E '^lib/.*\.so$' >/dev/null; then
+  mkdir -p "$OUT/native"; unzip -qo "$APK" 'lib/*' -d "$OUT/native.tmp" && cp -r "$OUT/native.tmp/lib/." "$OUT/native/" && rm -rf "$OUT/native.tmp"
+fi
+for s in "$OUT"/splits/*.apk; do  # ABI splits carry the .so files
+  [ -e "$s" ] || continue
+  unzip -Z1 "$s" | grep -E '^lib/.*\.so$' >/dev/null && { mkdir -p "$OUT/native"; unzip -qo "$s" 'lib/*' -d "$OUT/native.tmp"; cp -r "$OUT/native.tmp/lib/." "$OUT/native/"; rm -rf "$OUT/native.tmp"; }
+done
+# React Native bundle
+if unzip -Z1 "$APK" | grep -x 'assets/index.android.bundle' >/dev/null; then
+  mkdir -p "$OUT/js"; unzip -qo -j "$APK" assets/index.android.bundle -d "$OUT/js"
+  if [ "$(head -c 8 "$OUT/js/index.android.bundle" | xxd -p)" = "c61fbc03c103191f" ]; then
+    mkdir -p "$OUT/hermes"
+    hbc-decompiler "$OUT/js/index.android.bundle" "$OUT/hermes/decompiled.js" >/dev/null 2>&1 \
+      && echo "hermes       decompiled -> hermes/decompiled.js" >> "$OUT/summary.txt" \
+      || echo "hermes       hbc-decompiler failed (bytecode version unsupported?) - try hbc-disassembler" >> "$OUT/summary.txt"
+  else
+    webcrack "$OUT/js/index.android.bundle" -o "$OUT/js/webcrack" >/dev/null 2>&1 || true
+    echo "js bundle    plain JS -> js/ (deobfuscated: js/webcrack/)" >> "$OUT/summary.txt"
+  fi
+fi
+wait $JP || true; wait $AP 2>/dev/null || true
+NJ=$(find "$OUT/jadx/sources" -name '*.java' 2>/dev/null | wc -l)
+ERR=$(grep -c 'ERROR' "$OUT/jadx.log" 2>/dev/null || true)
+echo "jadx         $NJ java files in jadx/sources ($ERR errors, see jadx.log)" >> "$OUT/summary.txt"
+PKG=$(grep -m1 '^package' "$OUT/summary.txt" | awk '{print $2}')
+if [ -n "$PKG" ] && [ -d "$OUT/jadx/sources/${PKG//.//}" ]; then
+  echo "app code     jadx/sources/${PKG//.//} ($(find "$OUT/jadx/sources/${PKG//.//}" -name '*.java' | wc -l) files)" >> "$OUT/summary.txt"
+fi
+TOP=$(find "$OUT/jadx/sources" -mindepth 1 -maxdepth 2 -type d 2>/dev/null | sed "s|$OUT/jadx/sources/||" | grep / | grep -vE '^(android|androidx|kotlin|kotlinx|com/google|org/intellij|org/jetbrains|okhttp3|okio|retrofit2|io/reactivex|dagger|javax)(/|$)' | head -25 | tr '\n' ' ')
+echo "packages     $TOP" >> "$OUT/summary.txt"
+echo "[apk-analyze] done in $((SECONDS-t0))s" >&2
+cat "$OUT/summary.txt"

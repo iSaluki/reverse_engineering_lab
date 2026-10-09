@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Headless Ghidra: import + auto-analyze + export everything as text.
+# usage: ghidra-analyze <binary> [-o OUTDIR] [--no-decomp] [--timeout SECS] [--entry ADDR[,ADDR..]] [-- extra analyzeHeadless args]
+#   raw firmware/shellcode: ghidra-analyze fw.bin --entry 0x8000100 -- -processor ARM:LE:32:Cortex -loader BinaryLoader -loader-baseAddr 0x8000000
+#   (--entry seeds disassembly; raw blobs default to their first byte)
+# Output (default OUTDIR=./work/<name>/ghidra):
+#   summary.txt functions.tsv imports.tsv exports.tsv strings.tsv decomp/*.c  project/ (reused by ghidra-query)
+set -euo pipefail
+RE_HOME=${RE_HOME:-/opt/re}
+GH=$RE_HOME/ghidra
+SCRIPTS=$(cd "$(dirname "$(readlink -f "$0")")/../tools/ghidra_scripts" && pwd)
+[ $# -ge 1 ] || { sed -n '2,7p' "$0"; exit 2; }
+BIN=$(readlink -f "$1"); shift
+NAME=$(basename "$BIN")
+OUT=""; DECOMP=1; TIMEOUT=60; EXTRA=(); ENTRY=-
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT=$2; shift ;;
+    --no-decomp) DECOMP=0 ;;
+    --timeout) TIMEOUT=$2; shift ;;
+    --entry) ENTRY=$2; shift ;;
+    --) shift; EXTRA=("$@"); break ;;
+    *) echo "unknown arg $1"; exit 2 ;;
+  esac; shift
+done
+OUT=$(realpath -m "${OUT:-./work/$NAME/ghidra}")
+rm -rf "$OUT/decomp"; mkdir -p "$OUT/project"
+LOG="$OUT/analyze.log"
+echo "[ghidra-analyze] $NAME -> $OUT (log: $LOG)" >&2
+t0=$SECONDS
+"$GH/support/analyzeHeadless" "$OUT/project" proj -import "$BIN" -overwrite \
+  -scriptPath "$SCRIPTS" -preScript MakeFunctions.java "$ENTRY" -postScript ExportAll.java "$OUT" "$DECOMP" "$TIMEOUT" "$(nproc)" \
+  "${EXTRA[@]}" >"$LOG" 2>&1 || { echo "analyzeHeadless failed; tail of log:" >&2; tail -30 "$LOG" >&2; exit 1; }
+grep -qE "ExportAll: done" "$LOG" || { echo "export script did not finish; tail of log:" >&2; grep -E "ERROR|Exception" "$LOG" | head -20 >&2; tail -15 "$LOG" >&2; exit 1; }
+echo "$NAME" > "$OUT/project/.program"
+echo "[ghidra-analyze] done in $((SECONDS-t0))s" >&2
+cat "$OUT/summary.txt"

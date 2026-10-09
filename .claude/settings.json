@@ -1,0 +1,46 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh",
+            "timeout": 900
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(re-triage:*)",
+      "Bash(re-auto:*)",
+      "Bash(re-doctor:*)",
+      "Bash(ghidra-analyze:*)",
+      "Bash(ghidra-query:*)",
+      "Bash(apk-analyze:*)",
+      "Bash(dotnet-decompile:*)",
+      "Bash(py-unpack:*)",
+      "Bash(jadx:*)",
+      "Bash(apktool:*)",
+      "Bash(r2:*)",
+      "Bash(rabin2:*)",
+      "Bash(diec:*)",
+      "Bash(capa:*)",
+      "Bash(floss:*)",
+      "Bash(goresym:*)",
+      "Bash(ilspycmd:*)",
+      "Bash(pycdc:*)",
+      "Bash(pycdas:*)",
+      "Bash(strings:*)",
+      "Bash(readelf:*)",
+      "Bash(objdump:*)",
+      "Bash(file:*)",
+      "Bash(xxd:*)",
+      "Bash(readpe:*)",
+      "Bash(binwalk:*)",
+      "Bash(yara:*)"
+    ]
+  }
+}
