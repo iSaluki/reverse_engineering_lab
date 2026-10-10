@@ -10,7 +10,8 @@ description: Static reverse engineering of native code (ELF, PE/DLL, Mach-O, .so
 ghidra-analyze BIN                    # -> work/<bin>/ghidra/ (≈10s small, ≈1min per 2k funcs; --no-decomp for huge bins)
 cat work/<bin>/ghidra/summary.txt     # arch, compiler, entry/main, counts, memory map
 ```
-Find the interesting code **by evidence**, then read only those functions:
+Find the interesting code **by evidence**, then read only those functions (for security bugs, `vuln-scan BIN` ranks dangerous
+call sites by input reachability: skill re-vulnhunt):
 ```bash
 G=work/<bin>/ghidra
 rg -i 'passw|key|flag|license|http|error' $G/strings.tsv | head -40   # column 3 = functions referencing the string

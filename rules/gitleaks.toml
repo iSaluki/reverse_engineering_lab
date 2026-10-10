@@ -1,0 +1,18 @@
+# gitleaks config used by vuln-scan: the full default ruleset plus allowlists for decompiler/tool noise.
+title = "reverse_engineering_lab"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "lab noise: Ghidra projects, smali duplicates, bundled third-party SDK code, binary assets"
+paths = [
+  '''/proj\.rep/''',
+  '''/apktool/smali[^/]*/''',
+  '''/apktool/original/''',
+  '''/(androidx|kotlin|kotlinx|okhttp3|okio)/''',
+  '''/com/google/(android|common|protobuf|gson)/''',
+  '''/org/(bouncycastle|spongycastle|apache)/''',
+  '''\.(png|jpe?g|gif|webp|ttf|otf|woff2?|mp3|mp4|ogg)$''',
+  '''/vuln/(semgrep|gitleaks)\.json$''',
+]

@@ -40,7 +40,15 @@
       "Bash(xxd:*)",
       "Bash(readpe:*)",
       "Bash(binwalk:*)",
-      "Bash(yara:*)"
+      "Bash(yara:*)",
+      "Bash(vuln-scan:*)",
+      "Bash(re-fuzz:*)",
+      "Bash(semgrep:*)",
+      "Bash(gitleaks:*)",
+      "Bash(rg:*)",
+      "Bash(afl-tmin:*)",
+      "Bash(afl-showmap:*)",
+      "Bash(afl-whatsup:*)"
     ]
   }
 }

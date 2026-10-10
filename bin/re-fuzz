@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Time-boxed AFL++ fuzzing + crash triage, sized for agents (no TUI, bounded runtime, deduplicated crash report).
+# usage: re-fuzz <binary> [-i SEEDDIR] [-s 'seed text']... [-t SECS] [-j N] [-x DICT] [-o OUTDIR] [--sysroot DIR]
+#                [--mode auto|instr|qemu] [-- target args, @@ = input file (stdin if no @@)]
+#        re-fuzz --build src.c [more.c] [-o BIN] [-- cflags]   compile a harness/target with afl-cc + ASan/UBSan
+#        re-fuzz --triage OUTDIR <binary> [-- args]          (re)triage crashes of an earlier run
+# Modes: instr = binary built with afl-cc (fast, use for source/harnesses); qemu = closed-source binary
+# (needs ./setup.sh --with-afl-qemu; foreign arch: AFL_QEMU_ARCHES="aarch64 arm mipsel" + --sysroot <rootfs>).
+# Output (default ./work/<bin>/fuzz): out/ (AFL state, crashes/), triage.txt (unique crashes + repro commands)
+set -uo pipefail
+RE_HOME=${RE_HOME:-/opt/re}
+TOOLS=$(cd "$(dirname "$(readlink -f "$0")")/../tools" && pwd)
+usage() { sed -n '2,10p' "$0"; exit 2; }
+[ $# -ge 1 ] || usage
+export AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_NO_UI=1 AFL_SKIP_BIN_CHECK=${AFL_SKIP_BIN_CHECK:-0} \
+       AFL_TRY_AFFINITY=1 AFL_NO_WARN_INSTABILITY=1
+
+if [ "$1" = "--build" ]; then
+  shift; SRCS=(); OUTB=""
+  while [ $# -gt 0 ]; do case "$1" in -o) OUTB=$2; shift ;; --) shift; break ;; *) SRCS+=("$1") ;; esac; shift; done
+  [ ${#SRCS[@]} -gt 0 ] || usage
+  OUTB=${OUTB:-${SRCS[0]%.*}.afl}
+  CC=afl-cc; case "${SRCS[0]}" in *.cc|*.cpp|*.cxx) CC=afl-c++ ;; esac
+  AFL_USE_ASAN=1 AFL_USE_UBSAN=1 $CC -g -O1 -fno-omit-frame-pointer "${SRCS[@]}" -o "$OUTB" "$@" \
+    && echo "[re-fuzz] built $OUTB (afl-instrumented, ASan+UBSan). Next: re-fuzz $OUTB -- [@@]" >&2
+  exit $?
+fi
+
+if [ "$1" = "--triage" ]; then
+  OUT=$(realpath "$2"); BIN=$(realpath "$3"); shift 3; [ "${1:-}" = "--" ] && shift
+  exec "$RE_HOME/venv/bin/python" -I "$TOOLS/fuzz_triage.py" "$OUT" "$BIN" -- "$@"
+fi
+
+BIN=$(realpath "$1"); shift
+SEEDS=""; SEEDTXT=(); SECS=300; JOBS=1; DICT=(); OUT=""; MODE=auto; SYSROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i) SEEDS=$2; shift ;; -s) SEEDTXT+=("$2"); shift ;; -t) SECS=$2; shift ;; -j) JOBS=$2; shift ;;
+    -x) DICT=(-x "$2"); shift ;; -o) OUT=$2; shift ;; --mode) MODE=$2; shift ;; --sysroot) SYSROOT=$2; shift ;;
+    --) shift; break ;;
+    *) echo "bad arg $1"; usage ;;
+  esac; shift
+done
+TARGS=("$@")
+W=$(realpath -m "${OUT:-./work/$(basename "$BIN")/fuzz}"); mkdir -p "$W"
+
+# ---- mode / arch
+INSTR=0; grep -qa '__AFL_SHM_ID\|__afl_area_ptr' "$BIN" && INSTR=1
+[ "$MODE" = auto ] && { [ $INSTR -eq 1 ] && MODE=instr || MODE=qemu; }
+QFLAG=()
+if [ "$MODE" = qemu ]; then
+  FT=$(file -bL "$BIN")
+  case "$FT" in
+    *x86-64*) ARCH=x86_64 ;; *aarch64*|*ARM\ aarch64*) ARCH=aarch64 ;; *ARM*) ARCH=arm ;;
+    *MIPS*LSB*|*LSB*MIPS*) ARCH=mipsel ;; *MIPS*) ARCH=mips ;; *80386*) ARCH=i386 ;; *PowerPC*) ARCH=ppc ;;
+    *) echo "[re-fuzz] unsupported arch for qemu mode: $FT" >&2; exit 1 ;;
+  esac
+  QT="$RE_HOME/afl-qemu/$ARCH/afl-qemu-trace"
+  if [ ! -x "$QT" ]; then
+    echo "[re-fuzz] $BIN is not afl-instrumented and QEMU mode for $ARCH is not built." >&2
+    echo "          build it: AFL_QEMU_ARCHES=\"$ARCH\" ./setup.sh --only afl_qemu   (~2 min)" >&2
+    echo "          or, with source: re-fuzz --build target.c   (instrumented + ASan, much faster)" >&2
+    exit 1
+  fi
+  export AFL_PATH="$RE_HOME/afl-qemu/$ARCH"; QFLAG=(-Q)
+  if [ "$ARCH" != x86_64 ] && [ "$ARCH" != i386 ]; then
+    if [ -z "$SYSROOT" ]; then case $ARCH in aarch64) SYSROOT=/usr/aarch64-linux-gnu ;; arm) SYSROOT=/usr/arm-linux-gnueabihf ;; esac; fi
+    [ -n "$SYSROOT" ] && export QEMU_LD_PREFIX=$(realpath "$SYSROOT")
+    [ -n "$SYSROOT" ] || echo "[re-fuzz] WARN: dynamic $ARCH binary needs --sysroot <extracted rootfs>" >&2
+  fi
+fi
+
+# ---- seeds
+IN="$W/in"
+if [ -n "$SEEDS" ]; then IN=$(realpath "$SEEDS"); else
+  mkdir -p "$IN"
+  i=0; for t in "${SEEDTXT[@]}"; do printf '%s' "$t" > "$IN/seed$i"; i=$((i+1)); done
+  if [ $i -eq 0 ]; then printf 'AAAAAAAA' > "$IN/s0"; printf '0' > "$IN/s1"; printf '{"a":[1,"b"]}' > "$IN/s2"
+    printf 'GET /index.html?a=1 HTTP/1.1\r\nHost: x\r\n\r\n' > "$IN/s3"; head -c 64 /dev/urandom > "$IN/s4"; fi
+fi
+HASFILE=0; for a in "${TARGS[@]}"; do [ "$a" = "@@" ] && HASFILE=1; done
+echo "[re-fuzz] $(basename "$BIN") mode=$MODE${ARCH:+ arch=$ARCH} input=$([ $HASFILE -eq 1 ] && echo file || echo stdin) for ${SECS}s x$JOBS -> $W" >&2
+
+# ---- run (main + secondaries), bounded by -V
+PIDS=()
+for n in $(seq 2 "$JOBS"); do
+  afl-fuzz "${QFLAG[@]}" -i "$IN" -o "$W/out" -S "s$n" -V "$SECS" "${DICT[@]}" -- "$BIN" "${TARGS[@]}" > "$W/afl-s$n.log" 2>&1 &
+  PIDS+=($!)
+done
+afl-fuzz "${QFLAG[@]}" -i "$IN" -o "$W/out" -M main -V "$SECS" "${DICT[@]}" -- "$BIN" "${TARGS[@]}" > "$W/afl-main.log" 2>&1
+RC=$?
+for p in "${PIDS[@]}"; do wait "$p"; done
+if [ $RC -ne 0 ] && [ ! -f "$W/out/main/fuzzer_stats" ]; then
+  echo "[re-fuzz] afl-fuzz failed; tail of $W/afl-main.log:" >&2; grep -E 'PROGRAM ABORT|\[-\]|Location' "$W/afl-main.log" | tail -8 >&2; exit 1
+fi
+grep -hE '^(execs_done|execs_per_sec|corpus_count|bitmap_cvg|saved_crashes|saved_hangs)' "$W/out/main/fuzzer_stats" | tr -s ' ' | tr '\n' ' ' >&2; echo >&2
+"$RE_HOME/venv/bin/python" -I "$TOOLS/fuzz_triage.py" "$W/out" "$BIN" -- "${TARGS[@]}"

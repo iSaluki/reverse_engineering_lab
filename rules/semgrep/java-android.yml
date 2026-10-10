@@ -1,0 +1,311 @@
+# Bug-bounty oriented rules for decompiled Java/Kotlin (jadx output). Run via `vuln-scan`, or directly:
+#   semgrep scan --metrics=off --config rules/semgrep/java-android.yml work/<app>/apk/jadx/sources/<pkg>
+# Each finding is a LEAD: confirm reachability (exported component / deep link / IPC) before calling it a bug.
+# metadata.verify says what to check; metadata.cwe classifies it for the report.
+rules:
+  # ---------------------------------------------------------------- WebView
+  - id: webview-url-from-intent
+    languages: [java]
+    severity: ERROR
+    message: WebView loads a URL/data derived from an Intent or deep-link (open redirect / XSS / file theft via WebView).
+    metadata:
+      cwe: "CWE-939: Improper Authorization in Handler for Custom URL Scheme"
+      verify: Is the component exported or BROWSABLE? Is the host allow-listed (beware startsWith/contains/endsWith checks)? JS enabled? JS interface or file access present?
+    mode: taint
+    pattern-sources:
+      - pattern: (android.content.Intent $I).getData()
+      - pattern: (android.content.Intent $I).getDataString()
+      - pattern: (android.content.Intent $I).$GET(...)
+      - pattern: getIntent()
+      - pattern: (android.net.Uri $U).getQueryParameter(...)
+      - pattern: (android.os.Bundle $B).getString(...)
+    pattern-sinks:
+      - pattern: (android.webkit.WebView $W).loadUrl(...)
+      - pattern: (android.webkit.WebView $W).loadDataWithBaseURL(...)
+      - pattern: (android.webkit.WebView $W).loadData(...)
+      - pattern: (android.webkit.WebView $W).evaluateJavascript(...)
+      - pattern: (android.webkit.WebView $W).postUrl(...)
+      - pattern: $X.loadUrl(...)
+
+  - id: webview-javascript-interface
+    languages: [java]
+    severity: WARNING
+    message: addJavascriptInterface exposes Java methods to page JS. Any page the WebView can be steered to can call them.
+    metadata:
+      cwe: "CWE-749: Exposed Dangerous Method or Function"
+      verify: List @JavascriptInterface methods on the bridge class (tokens, file access, intents?). Can an attacker control the loaded URL (deep link, redirect, http)?
+    pattern: $W.addJavascriptInterface($OBJ, $NAME)
+
+  - id: webview-file-access
+    languages: [java]
+    severity: WARNING
+    message: WebView allows file:// access (setAllowFileAccessFromFileURLs/UniversalAccessFromFileURLs = true) - local file theft if attacker HTML is loaded.
+    metadata:
+      cwe: "CWE-200: Exposure of Sensitive Information"
+      verify: Can an attacker get a file:// or attacker-controlled page loaded (exported activity, content provider, download into app dir)?
+    pattern-either:
+      - pattern: $S.setAllowFileAccessFromFileURLs(true)
+      - pattern: $S.setAllowUniversalAccessFromFileURLs(true)
+
+  - id: webview-ssl-error-proceed
+    languages: [java]
+    severity: ERROR
+    message: onReceivedSslError calls handler.proceed() - TLS errors ignored (MITM).
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      verify: Is proceed() unconditional? Which hosts does this WebView load (auth pages, tokens)?
+    pattern: |
+      public void onReceivedSslError(...) {
+        ...
+        $H.proceed();
+        ...
+      }
+
+  # ---------------------------------------------------------------- TLS
+  - id: trustmanager-accepts-all
+    languages: [java]
+    severity: ERROR
+    message: X509TrustManager.checkServerTrusted does not validate (empty or never throws) - MITM of HTTPS.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      verify: Is this TrustManager installed on the client used for real API calls (SSLContext.init / OkHttp sslSocketFactory), or only in a debug path?
+    patterns:
+      - pattern: |
+          public void checkServerTrusted(...) { ... }
+      - pattern-not: |
+          public void checkServerTrusted(...) { ... throw ...; ... }
+      - pattern-not: |
+          public void checkServerTrusted(...) { ... $X.checkServerTrusted(...); ... }
+      - pattern-not: |
+          public void checkServerTrusted(...) { ... $X.checkValidity(...); ... }
+
+  - id: hostname-verifier-accepts-all
+    languages: [java]
+    severity: ERROR
+    message: HostnameVerifier.verify returns true unconditionally - any certificate for any host is accepted.
+    metadata:
+      cwe: "CWE-297: Improper Validation of Certificate with Host Mismatch"
+      verify: Which HTTP client uses this verifier?
+    pattern-either:
+      - pattern: |
+          public boolean verify(String $H, javax.net.ssl.SSLSession $S) { return true; }
+      - pattern: org.apache.http.conn.ssl.SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER
+
+  # ---------------------------------------------------------------- IPC
+  - id: intent-redirection
+    languages: [java]
+    severity: ERROR
+    message: An Intent taken from another Intent's extras is launched (intent redirection - reach non-exported components / grant URI permissions).
+    metadata:
+      cwe: "CWE-926: Improper Export of Android Application Components"
+      verify: Is the receiving component exported? Can the nested intent target a non-exported provider with FLAG_GRANT_READ_URI_PERMISSION?
+    mode: taint
+    pattern-sources:
+      - pattern: $X.getParcelableExtra(...)
+      - pattern: $X.getParcelable(...)
+      - pattern: android.content.Intent.parseUri(...)
+    pattern-sinks:
+      - pattern: startActivity(...)
+      - pattern: $C.startActivity(...)
+      - pattern: startActivityForResult(...)
+      - pattern: $C.startActivityForResult(...)
+      - pattern: $C.startService(...)
+      - pattern: $C.sendBroadcast(...)
+      - pattern: setResult(...)
+
+  - id: pending-intent-mutable-implicit
+    languages: [java]
+    severity: WARNING
+    message: Mutable PendingIntent wrapping an Intent without an explicit component - receiver can rewrite it.
+    metadata:
+      cwe: "CWE-927: Use of Implicit Intent for Sensitive Communication"
+      verify: Is the base Intent implicit (no setClass/setComponent/setPackage)? Who receives this PendingIntent (notification, other app, slice)?
+    patterns:
+      - pattern-either:
+          - pattern: android.app.PendingIntent.$M($CTX, $RC, new android.content.Intent(), $FLAGS)
+          - pattern: android.app.PendingIntent.$M($CTX, $RC, new android.content.Intent($ACTION), $FLAGS)
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^get(Activity|Service|Broadcast|ForegroundService)$
+
+  - id: provider-path-traversal
+    languages: [java]
+    severity: ERROR
+    message: ContentProvider.openFile builds a File from the Uri path without canonicalisation (path traversal - read/write app-private files).
+    metadata:
+      cwe: "CWE-22: Path Traversal"
+      verify: Is the provider exported or grantable (grantUriPermissions)? Does it check getCanonicalPath().startsWith(base)? Try ..%2F in the last path segment.
+    patterns:
+      - pattern-inside: |
+          public ParcelFileDescriptor openFile(android.net.Uri $U, String $MODE) { ... }
+      - pattern-either:
+          - pattern: new java.io.File(..., $U.getLastPathSegment())
+          - pattern: new java.io.File(..., $U.getPath())
+          - pattern: new java.io.File($U.getPath())
+      - pattern-not-inside: |
+          $F.getCanonicalPath();
+          ...
+
+  - id: fragment-injection
+    languages: [java]
+    severity: WARNING
+    message: PreferenceActivity.isValidFragment returns true - an exported activity can load arbitrary fragments.
+    metadata:
+      cwe: "CWE-470: Use of Externally-Controlled Input to Select Classes"
+      verify: Is the PreferenceActivity exported? Which fragments with sensitive behaviour exist?
+    pattern: |
+      protected boolean isValidFragment(String $F) { return true; }
+
+  - id: world-readable-file
+    languages: [java]
+    severity: WARNING
+    message: File or prefs created MODE_WORLD_READABLE/WRITEABLE.
+    metadata:
+      cwe: "CWE-732: Incorrect Permission Assignment"
+      verify: Only exploitable on old targetSdk (<24). What is stored?
+    pattern-either:
+      - pattern: $C.openFileOutput($N, 1)
+      - pattern: $C.openFileOutput($N, 2)
+      - pattern: openFileOutput($N, 1)
+      - pattern: openFileOutput($N, 2)
+      - pattern: $C.getSharedPreferences($N, 1)
+      - pattern: $C.getSharedPreferences($N, 2)
+      - pattern: getSharedPreferences($N, 1)
+      - pattern: getSharedPreferences($N, 2)
+      - pattern: MODE_WORLD_READABLE
+      - pattern: MODE_WORLD_WRITEABLE
+      - pattern: android.content.Context.MODE_WORLD_READABLE
+      - pattern: android.content.Context.MODE_WORLD_WRITEABLE
+
+  # ---------------------------------------------------------------- injection / code loading
+  - id: sql-injection-concat
+    languages: [java]
+    severity: WARNING
+    message: SQL built by string concatenation passed to rawQuery/execSQL (SQLi - mostly relevant via exported ContentProvider).
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      verify: Does attacker input (provider selection/projection/uri segment, intent extra) reach the concatenated part?
+    patterns:
+      - pattern-either:
+          - pattern: $DB.rawQuery($A + $B, ...)
+          - pattern: $DB.execSQL($A + $B, ...)
+          - pattern: $DB.rawQuery(String.format(...), ...)
+          - pattern: $DB.execSQL(String.format(...), ...)
+          - pattern: $DB.rawQuery($SB.toString(), ...)
+          - pattern: $DB.execSQL($SB.toString(), ...)
+
+  - id: command-execution
+    languages: [java]
+    severity: WARNING
+    message: Runtime.exec / ProcessBuilder with a non-constant command.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      verify: Does input from IPC/network reach the command? Shell (sh -c) or argv array?
+    patterns:
+      - pattern-either:
+          - pattern: Runtime.getRuntime().exec($CMD, ...)
+          - pattern: new ProcessBuilder($CMD, ...)
+      - pattern-not: Runtime.getRuntime().exec("...", ...)
+      - pattern-not: new ProcessBuilder("...", ...)
+
+  - id: dynamic-code-loading
+    languages: [java]
+    severity: WARNING
+    message: Classes/dex loaded at runtime - if the path is writable by others (external storage, downloads) this is code execution.
+    metadata:
+      cwe: "CWE-94: Code Injection"
+      verify: Where does the dex/jar/so path come from? External storage, network download without signature check, or a provider?
+    pattern-either:
+      - pattern: new dalvik.system.DexClassLoader(...)
+      - pattern: new dalvik.system.PathClassLoader($P, ...)
+      - pattern: new dalvik.system.InMemoryDexClassLoader(...)
+      - pattern: System.load($P)
+
+  - id: java-deserialization
+    languages: [java]
+    severity: WARNING
+    message: Java/YAML/XML object deserialization of possibly untrusted data.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      verify: Where do the bytes come from (intent extra, file, network)? Which gadget libraries are on the classpath (commons-collections, ...)?
+    pattern-either:
+      - pattern: (java.io.ObjectInputStream $O).readObject()
+      - pattern: new java.beans.XMLDecoder(...)
+      - pattern: (com.thoughtworks.xstream.XStream $X).fromXML(...)
+      - pattern: new org.yaml.snakeyaml.Yaml().load(...)
+      - pattern: (com.fasterxml.jackson.databind.ObjectMapper $M).enableDefaultTyping(...)
+
+  - id: xxe-documentbuilder
+    languages: [java]
+    severity: INFO
+    message: XML parser created without disabling DTDs/external entities (XXE if it parses attacker XML).
+    metadata:
+      cwe: "CWE-611: XXE"
+      verify: Does it parse attacker-controlled XML? Android's default parser is usually not exploitable; server-side/desktop Java is.
+    patterns:
+      - pattern: javax.xml.parsers.DocumentBuilderFactory.newInstance()
+      - pattern-not-inside: |
+          $F = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+          ...
+          $F.setFeature(...);
+
+  # ---------------------------------------------------------------- crypto
+  - id: weak-cipher-mode
+    languages: [java]
+    severity: WARNING
+    message: Weak cipher / ECB mode (Cipher.getInstance with DES, RC4, ECB or bare "AES", which defaults to ECB).
+    metadata:
+      cwe: "CWE-327: Use of a Broken or Risky Cryptographic Algorithm"
+      verify: What does it protect? Pair with a hardcoded key for a reportable issue (decrypt stored/transmitted data).
+    patterns:
+      - pattern: javax.crypto.Cipher.getInstance($ALG, ...)
+      - metavariable-regex:
+          metavariable: $ALG
+          regex: (?i)^"((AES|DES|DESede|RC4|ARCFOUR|Blowfish)"|[^"]*/ECB/|DES/|DESede/|RC4)
+
+  - id: hardcoded-crypto-key
+    languages: [java]
+    severity: ERROR
+    message: Symmetric key or IV built from a constant (anyone with the APK can decrypt).
+    metadata:
+      cwe: "CWE-321: Use of Hard-coded Cryptographic Key"
+      verify: What is encrypted with it - local storage, request signing, API payloads? Reproduce decryption in repy.
+    pattern-either:
+      - pattern: new javax.crypto.spec.SecretKeySpec("...".getBytes(...), ...)
+      - pattern: new javax.crypto.spec.SecretKeySpec("...".getBytes(), ...)
+      - pattern: new javax.crypto.spec.SecretKeySpec(new byte[]{...}, ...)
+      - pattern: new javax.crypto.spec.IvParameterSpec("...".getBytes(...))
+      - pattern: new javax.crypto.spec.IvParameterSpec("...".getBytes())
+      - pattern: new javax.crypto.spec.IvParameterSpec(new byte[]{...})
+
+  - id: hardcoded-key-material-field
+    languages: [java]
+    severity: WARNING
+    message: Key/IV/secret-named field or variable initialised from a literal (follow it into Cipher/SecretKeySpec/Mac).
+    metadata:
+      cwe: "CWE-321: Use of Hard-coded Cryptographic Key"
+      verify: Where is it used (rg the name)? If it keys encryption of stored credentials or traffic, decrypt a sample in repy.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: $T $NAME = "$V";
+              - metavariable-regex:
+                  metavariable: $V
+                  regex: '^(?=.{8,}$)(?!(?:[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+|[A-Z][A-Za-z]*(?:[A-Z][a-z]*)*|[A-Z][A-Z_]+|[a-z0-9_.:/-]+)$).*$|^[0-9a-fA-F]{16,}$'
+          - pattern: $T $NAME = new byte[]{$B, ...};
+          - pattern: $T $NAME = {$B, ...};
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '^(?:(?:key|iv|secret|salt|passphrase|nonce)(?:Bytes|Str|String|Spec|Data|_bytes)?|[A-Za-z0-9]*?(?:Key|Iv|IV|Secret|Salt|Passphrase|Nonce)(?:Bytes|Str|String|Spec|Data)?|[a-z0-9_]*_(?:key|iv|secret|salt|passphrase|nonce)(?:_bytes|_str)?|(?:[A-Z0-9]+_)*(?:KEY|IV|SECRET|SALT|PASSPHRASE|NONCE)(?:_BYTES|_STR)?)$'
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '(?i)^(?!.*(registry|pref|intent|extra|header|param|alias|bundle|column|field|tag|cache|state|result|sort|lookup|name|type|prefix|suffix|url|path|file)).*$'
+
+  - id: insecure-random-for-secrets
+    languages: [java]
+    severity: INFO
+    message: java.util.Random used - predictable if it generates tokens, nonces, OTPs or keys.
+    metadata:
+      cwe: "CWE-330: Use of Insufficiently Random Values"
+      verify: Only interesting if the value is security-relevant.
+    pattern: new java.util.Random(...)

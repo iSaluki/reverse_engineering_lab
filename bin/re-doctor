@@ -11,9 +11,12 @@ ok=(); miss=()
 for t in re-triage re-auto ghidra-analyze ghidra-query apk-analyze dotnet-decompile py-unpack analyzeHeadless jadx apktool \
          vineflower d2j-dex2jar r2 rabin2 diec capa floss goresym upx ilspycmd pycdc pycdas pyinstxtractor-ng decompyle3 \
          repy frida hbc-decompiler asar webcrack js-beautify binwalk yara readpe osslsigncode aapt apksigner \
-         wasm-decompile gdb gdb-multiarch strace ltrace qemu-aarch64 qemu-arm 7z innoextract exiftool ssdeep; do
+         wasm-decompile gdb gdb-multiarch strace ltrace qemu-aarch64 qemu-arm 7z innoextract exiftool ssdeep \
+         vuln-scan re-fuzz semgrep gitleaks afl-fuzz afl-cc afl-tmin; do
   command -v "$t" >/dev/null 2>&1 && ok+=("$t") || miss+=("$t")
 done
 echo "ok (${#ok[@]}): ${ok[*]}"
 command -v rewine >/dev/null || echo "optional, not installed: wine (./setup.sh --with-wine)"
+q=$(ls "$RE_HOME"/afl-qemu 2>/dev/null | tr '\n' ' ')
+[ -n "$q" ] && echo "afl qemu mode: $q" || echo "optional, not installed: AFL++ QEMU mode for closed binaries (./setup.sh --with-afl-qemu)"
 [ ${#miss[@]} -eq 0 ] || { echo "MISSING (${#miss[@]}): ${miss[*]}"; exit 1; }

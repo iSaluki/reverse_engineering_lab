@@ -1,0 +1,165 @@
+# Bug-bounty oriented rules for Electron apps (asar extract), React Native bundles (webcrack / hermes output)
+# and other shipped JavaScript. Electron misconfig + an XSS or open navigation is the classic desktop RCE chain.
+rules:
+  - id: electron-node-integration
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: BrowserWindow/webview with nodeIntegration enabled - any XSS becomes RCE.
+    metadata:
+      cwe: "CWE-94: Code Injection"
+      verify: Does the window ever render remote or user-controlled content (markdown, chat, deep-link URL)?
+    pattern-either:
+      - pattern: "{..., nodeIntegration: true, ...}"
+      - pattern: "{..., nodeIntegrationInSubFrames: true, ...}"
+      - pattern: "{..., nodeIntegrationInWorker: true, ...}"
+
+  - id: electron-context-isolation-off
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: contextIsolation disabled - page JS can tamper with preload/Electron internals (prototype pollution -> RCE).
+    metadata:
+      cwe: "CWE-653: Improper Isolation"
+      verify: Electron < 12 defaults to false even when unset - check package.json electron version.
+    pattern: "{..., contextIsolation: false, ...}"
+
+  - id: electron-sandbox-or-websecurity-off
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Renderer sandbox or webSecurity disabled / insecure content allowed.
+    metadata:
+      cwe: "CWE-693: Protection Mechanism Failure"
+      verify: Chain with content injection in that window.
+    pattern-either:
+      - pattern: "{..., sandbox: false, ...}"
+      - pattern: "{..., webSecurity: false, ...}"
+      - pattern: "{..., allowRunningInsecureContent: true, ...}"
+      - pattern: "{..., experimentalFeatures: true, ...}"
+      - pattern: "{..., enableRemoteModule: true, ...}"
+
+  - id: electron-open-external
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: shell.openExternal/openPath with a non-constant argument (file://, smb://, custom scheme handlers -> RCE on Windows/macOS).
+    metadata:
+      cwe: "CWE-939: Improper Authorization in Handler for Custom URL Scheme"
+      verify: Can a link in rendered content, a deep link or IPC message reach it? Is the protocol restricted to http(s)?
+    patterns:
+      - pattern-either:
+          - pattern: $S.openExternal($U, ...)
+          - pattern: $S.openPath($U)
+          - pattern: $S.openItem($U)
+      - pattern-not: $S.openExternal("...", ...)
+
+  - id: electron-ipc-handler
+    languages: [javascript, typescript]
+    severity: INFO
+    message: ipcMain handler - main-process attack surface reachable from any renderer (map them; look for fs/child_process/openExternal inside).
+    metadata:
+      cwe: "CWE-749: Exposed Dangerous Method or Function"
+      verify: Does the handler check event.senderFrame.url? What can a compromised renderer do with it?
+    patterns:
+      - pattern-either:
+          - pattern: $IPC.handle($CH, $F)
+          - pattern: $IPC.handleOnce($CH, $F)
+          - pattern: $IPC.on($CH, $F)
+      - metavariable-regex:
+          metavariable: $IPC
+          regex: ^(ipcMain|electron\.ipcMain|[A-Za-z_$][\w$]*\.ipcMain)$
+
+  - id: js-command-exec
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: child_process exec/spawn with a non-constant command.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      verify: Does data from IPC, a URL handler, an update manifest or a file reach the command string?
+    patterns:
+      - pattern-either:
+          - pattern: $CP.exec($CMD, ...)
+          - pattern: $CP.execSync($CMD, ...)
+          - pattern: "$CP.spawn($CMD, $ARGS, {..., shell: true, ...})"
+      - metavariable-regex:
+          metavariable: $CP
+          regex: (child_process|cp|childProcess|require\("child_process"\))
+      - pattern-not: $CP.exec("...", ...)
+      - pattern-not: $CP.execSync("...", ...)
+
+  - id: js-eval-dynamic
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: eval / new Function / vm on a non-constant string.
+    metadata:
+      cwe: "CWE-95: Eval Injection"
+      verify: Bundlers emit some of these - only care if remote/user data reaches it.
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: new Function(..., $X)
+          - pattern: $VM.runInNewContext($X, ...)
+          - pattern: $VM.runInThisContext($X, ...)
+      - pattern-not: eval("...")
+      - pattern-not: new Function(..., "...")
+
+  - id: js-postmessage-no-origin-check
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: message event listener that never reads event.origin (cross-origin postMessage injection).
+    metadata:
+      cwe: "CWE-346: Origin Validation Error"
+      verify: What does the handler do with event.data (navigate, set token, eval, call IPC)?
+    patterns:
+      - pattern-either:
+          - pattern: $W.addEventListener("message", $H, ...)
+          - pattern: $W.onmessage = $H
+      - metavariable-pattern:
+          metavariable: $H
+          patterns:
+            - pattern-either:
+                - pattern: "function (...) { ... }"
+                - pattern: "(...) => { ... }"
+                - pattern: "(...) => $EXPR"
+            - pattern-not-regex: \.origin\b
+
+  - id: js-dom-xss-sink
+    languages: [javascript, typescript]
+    severity: INFO
+    message: HTML injection sink with a non-constant value (DOM XSS; in Electron with Node enabled this is RCE).
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+      verify: Is the value attacker-influenced (message text, filename, URL param) and not sanitized (DOMPurify)?
+    patterns:
+      - pattern-either:
+          - pattern: $E.innerHTML = $V
+          - pattern: $E.outerHTML = $V
+          - pattern: document.write($V)
+          - pattern: $E.insertAdjacentHTML($P, $V)
+          - pattern: "{dangerouslySetInnerHTML: {__html: $V}}"
+      - pattern-not: $E.innerHTML = "..."
+      - pattern-not: $E.innerHTML = ""
+
+  - id: js-tls-verification-off
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: TLS verification disabled (rejectUnauthorized false / NODE_TLS_REJECT_UNAUTHORIZED=0 / certificate-error override).
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      verify: Which requests (updates, auth)? MITM of the updater is RCE.
+    pattern-either:
+      - pattern: "{..., rejectUnauthorized: false, ...}"
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+      - pattern: |
+          $APP.on("certificate-error", function (...) { ... $CB(true); ... })
+      - pattern: |
+          $APP.on("certificate-error", (...) => { ... $CB(true); ... })
+
+  - id: rn-webview-wide-origin
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: React Native WebView allows any origin / file access / universal file access.
+    metadata:
+      cwe: "CWE-749: Exposed Dangerous Method or Function"
+      verify: Can the WebView be navigated to attacker content (deep link param)? Is there an onMessage bridge?
+    pattern-either:
+      - pattern: '{..., originWhitelist: ["*"], ...}'
+      - pattern: "{..., allowUniversalAccessFromFileURLs: true, ...}"
+      - pattern: "{..., allowFileAccessFromFileURLs: true, ...}"

@@ -1,0 +1,179 @@
+# Bug-bounty oriented rules for decompiled C# (ilspycmd output from dotnet-decompile / Unity / Xamarin).
+# Each finding is a LEAD: confirm that attacker data reaches it (named pipe, HTTP listener, file the user opens, IPC).
+rules:
+  - id: dotnet-insecure-deserializer
+    languages: [csharp]
+    severity: ERROR
+    message: Dangerous .NET formatter deserializes data (BinaryFormatter-family = RCE with ysoserial.net gadgets).
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      verify: Where does the stream come from - network, named pipe, remoting, file the victim opens, registry? Generate a gadget with ysoserial.net (off-box) for the PoC.
+    pattern-either:
+      - pattern: new BinaryFormatter().Deserialize(...)
+      - pattern: (BinaryFormatter $F).Deserialize(...)
+      - pattern: (System.Runtime.Serialization.Formatters.Binary.BinaryFormatter $F).Deserialize(...)
+      - pattern: (NetDataContractSerializer $F).Deserialize(...)
+      - pattern: (NetDataContractSerializer $F).ReadObject(...)
+      - pattern: (SoapFormatter $F).Deserialize(...)
+      - pattern: (LosFormatter $F).Deserialize(...)
+      - pattern: (ObjectStateFormatter $F).Deserialize(...)
+      - pattern: new LosFormatter().Deserialize(...)
+      - pattern: new NetDataContractSerializer().Deserialize(...)
+      - pattern: new SoapFormatter().Deserialize(...)
+
+  - id: dotnet-json-typenamehandling
+    languages: [csharp]
+    severity: ERROR
+    message: Json.NET TypeNameHandling other than None - attacker JSON can choose the type to instantiate (RCE gadgets).
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      verify: Is there a SerializationBinder restricting types? Does attacker JSON reach DeserializeObject with these settings?
+    patterns:
+      - pattern: TypeNameHandling.$X
+      - metavariable-regex:
+          metavariable: $X
+          regex: ^(All|Auto|Objects|Arrays)$
+
+  - id: dotnet-javascriptserializer-typeresolver
+    languages: [csharp]
+    severity: ERROR
+    message: JavaScriptSerializer with SimpleTypeResolver - type-confusion deserialization.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      verify: Does attacker JSON reach Deserialize?
+    pattern: new JavaScriptSerializer(new SimpleTypeResolver())
+
+  - id: dotnet-process-start
+    languages: [csharp]
+    severity: WARNING
+    message: Process.Start / ProcessStartInfo with a non-constant command or arguments.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      verify: Does input from a URI handler, IPC, update manifest or file reach it? UseShellExecute=true with a URL/path is also an argument-injection vector.
+    patterns:
+      - pattern-either:
+          - pattern: Process.Start($A, ...)
+          - pattern: System.Diagnostics.Process.Start($A, ...)
+          - pattern: new ProcessStartInfo($A, ...)
+      - pattern-not: Process.Start("...")
+      - pattern-not: Process.Start("...", "...")
+      - pattern-not: System.Diagnostics.Process.Start("...")
+      - pattern-not: new ProcessStartInfo("...")
+      - pattern-not: new ProcessStartInfo("...", "...")
+
+  - id: dotnet-sql-concat
+    languages: [csharp]
+    severity: WARNING
+    message: SQL command text built by concatenation/interpolation.
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      verify: Does attacker input reach the concatenated part (server component, local DB shared between users)?
+    pattern-either:
+      - pattern: new SqlCommand($A + $B, ...)
+      - pattern: new SqlCommand($"...", ...)
+      - pattern: new SqlCommand(string.Format(...), ...)
+      - pattern: new SQLiteCommand($A + $B, ...)
+      - pattern: new SqliteCommand($A + $B, ...)
+      - pattern: $C.CommandText = $A + $B
+      - pattern: $C.CommandText = $"..."
+      - pattern: $C.CommandText = string.Format(...)
+
+  - id: dotnet-xxe
+    languages: [csharp]
+    severity: WARNING
+    message: XML parser with DTD processing / resolver enabled (XXE, SSRF, file read).
+    metadata:
+      cwe: "CWE-611: XXE"
+      verify: Does it parse attacker XML? Target framework < 4.5.2 makes XmlDocument unsafe by default.
+    pattern-either:
+      - pattern: $S.DtdProcessing = DtdProcessing.Parse
+      - pattern: $D.XmlResolver = new XmlUrlResolver()
+      - pattern: $S.ProhibitDtd = false
+
+  - id: dotnet-cert-validation-disabled
+    languages: [csharp]
+    severity: ERROR
+    message: TLS certificate validation callback always returns true (MITM; e.g. of the auto-updater).
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      verify: Which connections use it - updates, login, API? MITM of an update channel is usually RCE.
+    pattern-either:
+      - pattern: ServicePointManager.ServerCertificateValidationCallback = (...) => true
+      - pattern: ServicePointManager.ServerCertificateValidationCallback += (...) => true
+      - pattern: $H.ServerCertificateCustomValidationCallback = (...) => true
+      - pattern: $H.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+
+  - id: dotnet-assembly-load-bytes
+    languages: [csharp]
+    severity: WARNING
+    message: Assembly loaded from bytes/path at runtime (plugin or update loading - check integrity and path writability).
+    metadata:
+      cwe: "CWE-494: Download of Code Without Integrity Check"
+      verify: Is the source a network download or user-writable directory (DLL planting / update hijack)?
+    pattern-either:
+      - pattern: Assembly.Load((byte[] $B))
+      - pattern: Assembly.LoadFrom($P)
+      - pattern: Assembly.LoadFile($P)
+      - pattern: Assembly.UnsafeLoadFrom($P)
+
+  - id: dotnet-xslt-script
+    languages: [csharp]
+    severity: WARNING
+    message: XsltSettings enables script/document() - code execution if the stylesheet is attacker-controlled.
+    metadata:
+      cwe: "CWE-94: Code Injection"
+      verify: Who controls the XSLT?
+    pattern-either:
+      - pattern: new XsltSettings(true, true)
+      - pattern: new XsltSettings(false, true)
+      - pattern: XsltSettings.TrustedXslt
+
+  - id: dotnet-weak-crypto
+    languages: [csharp]
+    severity: INFO
+    message: Weak crypto primitive (DES/3DES/RC2/MD5/SHA1 or ECB mode).
+    metadata:
+      cwe: "CWE-327: Use of a Broken or Risky Cryptographic Algorithm"
+      verify: Only reportable with impact (e.g. combined with a hardcoded key protecting credentials).
+    pattern-either:
+      - pattern: DES.Create(...)
+      - pattern: new DESCryptoServiceProvider()
+      - pattern: TripleDES.Create(...)
+      - pattern: RC2.Create(...)
+      - pattern: MD5.Create(...)
+      - pattern: $C.Mode = CipherMode.ECB
+
+  - id: dotnet-hardcoded-key
+    languages: [csharp]
+    severity: ERROR
+    message: Symmetric key / IV taken from a string constant.
+    metadata:
+      cwe: "CWE-321: Use of Hard-coded Cryptographic Key"
+      verify: What does it protect (saved credentials, license, API signing)? Reproduce decryption in repy.
+    pattern-either:
+      - pattern: $A.Key = Encoding.$E.GetBytes("...")
+      - pattern: $A.IV = Encoding.$E.GetBytes("...")
+      - pattern: new Rfc2898DeriveBytes("...", ...)
+      - pattern: $A.CreateDecryptor(Encoding.$E.GetBytes("..."), ...)
+
+  - id: dotnet-hardcoded-key-material-field
+    languages: [csharp]
+    severity: WARNING
+    message: Key/IV/secret-named field or variable initialised from a literal.
+    metadata:
+      cwe: "CWE-321: Use of Hard-coded Cryptographic Key"
+      verify: Where is it used? If it protects stored credentials, license data or traffic, decrypt a sample in repy.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: $T $NAME = "$V";
+              - metavariable-regex:
+                  metavariable: $V
+                  regex: '^(?=.{8,}$)(?!(?:[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+|[A-Z][A-Za-z]*(?:[A-Z][a-z]*)*|[A-Z][A-Z_]+|[a-z0-9_.:/-]+)$).*$|^[0-9a-fA-F]{16,}$'
+          - pattern: $T $NAME = new byte[] {$B, ...};
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '^(?:(?:key|iv|secret|salt|passphrase|nonce)(?:Bytes|Str|String|Spec|Data|_bytes)?|[A-Za-z0-9]*?(?:Key|Iv|IV|Secret|Salt|Passphrase|Nonce)(?:Bytes|Str|String|Spec|Data)?|[a-z0-9_]*_(?:key|iv|secret|salt|passphrase|nonce)(?:_bytes|_str)?|(?:[A-Z0-9]+_)*(?:KEY|IV|SECRET|SALT|PASSPHRASE|NONCE)(?:_BYTES|_STR)?)$'
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '(?i)^(?!.*(registry|pref|intent|extra|header|param|alias|bundle|column|field|tag|cache|state|result|sort|lookup|name|type|prefix|suffix|url|path|file)).*$'

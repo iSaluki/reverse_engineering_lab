@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # One-shot static pipeline: triage, then run the right unpacker/decompiler for the file type.
-# usage: re-auto <file> [-o WORKDIR] [--capa] [--no-ghidra]
+# usage: re-auto <file> [-o WORKDIR] [--capa] [--no-ghidra] [--vuln]   (--vuln: then run vuln-scan = bug-bounty leads)
 # WORKDIR (default ./work/<name>) gets triage.txt + per-tool subdirs; INDEX.txt lists what was produced.
 # Native code goes to Ghidra (WORKDIR/ghidra: functions.tsv, strings.tsv, decomp/*.c; query with ghidra-query).
 set -uo pipefail
 [ $# -ge 1 ] || { sed -n '2,5p' "$0"; exit 2; }
-IN=$(realpath "$1"); shift; NAME=$(basename "$IN"); W=""; CAPA=0; GHIDRA=1
-while [ $# -gt 0 ]; do case "$1" in -o) W=$2; shift ;; --capa) CAPA=1 ;; --no-ghidra) GHIDRA=0 ;; *) echo "bad arg $1"; exit 2 ;; esac; shift; done
+IN=$(realpath "$1"); shift; NAME=$(basename "$IN"); W=""; CAPA=0; GHIDRA=1; VULN=0
+while [ $# -gt 0 ]; do case "$1" in -o) W=$2; shift ;; --capa) CAPA=1 ;; --no-ghidra) GHIDRA=0 ;; --vuln) VULN=1 ;; *) echo "bad arg $1"; exit 2 ;; esac; shift; done
 W=$(realpath -m "${W:-./work/$NAME}"); mkdir -p "$W"
 say() { echo "[re-auto] $*" >&2; }
 
@@ -50,3 +50,4 @@ esac
 
 { echo "# outputs for $NAME"; (cd "$W" && find . -maxdepth 2 -not -path './ghidra/project*' -not -path '*/decomp/*' | sort | head -60); } > "$W/INDEX.txt"
 say "done. index: $W/INDEX.txt"
+if [ $VULN -eq 1 ]; then vuln-scan "$W"; else say "hunting bugs? vuln-scan $W   (ranked leads -> $W/vuln/CANDIDATES.md; skill: re-vulnhunt)"; fi
