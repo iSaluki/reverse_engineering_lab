@@ -4,8 +4,11 @@
 #
 #   ./setup.sh               install everything (default set)
 #   ./setup.sh --with-wine   also install wine (run Windows PEs dynamically, ~1 GB)
+#   ./setup.sh --with-afl-qemu  also build AFL++ QEMU mode (binary-only fuzzing, ~2 min per arch;
+#                               arches: AFL_QEMU_ARCHES="x86_64 aarch64 arm mipsel mips" default x86_64)
 #   ./setup.sh --force       redo every step
-#   ./setup.sh --only STEP   (re)run one step: apt ghidra jvm_tools native_tools dotnet python node wine links
+#   ./setup.sh --only STEP   (re)run one step: apt ghidra jvm_tools native_tools dotnet python node vuln_tools
+#                            wine afl_qemu links
 #
 # Logs: $RE_HOME/logs/<step>.log   Status: re-doctor
 # Bump versions below; discover new tags with:
@@ -29,16 +32,20 @@ FLOSS_VER=3.1.1
 GORESYM_VER=3.4.1
 GEF_VER=2026.01
 ILSPY_VER=11.1.0.9782       # ilspycmd (NuGet)
+SEMGREP_VER=1.180.0         # vuln-scan: rules in rules/semgrep
+GITLEAKS_VER=8.30.1         # vuln-scan: secrets
+AFLPP_VER=4.09c             # must equal Ubuntu's afl++ package version (QEMU mode is built from this tag)
 # ---------------------------------------------------------------------------
 
 GH=https://github.com
-FORCE=0; WITH_WINE=0; ONLY=""
+FORCE=0; WITH_WINE=0; WITH_AFL_QEMU=0; ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1 ;;
     --with-wine) WITH_WINE=1 ;;
+    --with-afl-qemu) WITH_AFL_QEMU=1 ;;
     --only) ONLY=$2; FORCE=1; shift ;;   # implies --force for that step
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown arg $1"; exit 2 ;;
   esac
   shift
@@ -214,6 +221,35 @@ step_python() {
   true
 }
 
+step_vuln_tools() {   # bug-bounty layer: semgrep (own venv: its pins clash with angr), gitleaks, AFL++
+  command -v uv >/dev/null || pip3 install -q uv
+  [ -x "$RE_HOME/semgrep-venv/bin/python" ] || uv venv -q "$RE_HOME/semgrep-venv"
+  uv pip install -q --python "$RE_HOME/semgrep-venv/bin/python" "semgrep==$SEMGREP_VER"
+  printf '#!/bin/sh\nexport SEMGREP_SEND_METRICS=off SEMGREP_ENABLE_VERSION_CHECK=0\nexec %s "$@"\n' \
+    "$RE_HOME/semgrep-venv/bin/semgrep" > "$RE_HOME/bin/.semgrep"
+  chmod +x "$RE_HOME/bin/.semgrep"; link "$RE_HOME/bin/.semgrep" semgrep
+
+  dl "$GH/gitleaks/gitleaks/releases/download/v$GITLEAKS_VER/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" "$RE_HOME/dl/gitleaks.tgz"
+  mkdir -p "$RE_HOME/gitleaks"; tar -xzf "$RE_HOME/dl/gitleaks.tgz" -C "$RE_HOME/gitleaks" gitleaks
+  link "$RE_HOME/gitleaks/gitleaks" gitleaks
+
+  # AFL++ (afl-cc/afl-fuzz/afl-tmin...). Runs in parallel with native_tools, so wait for the dpkg lock.
+  $SUDO apt-get install -y -q --no-install-recommends -o DPkg::Lock::Timeout=900 afl++ libclang-rt-17-dev  # rt = ASan/UBSan runtimes
+}
+
+step_afl_qemu() {   # opt-in: AFL++ QEMU mode for closed-source binaries -> $RE_HOME/afl-qemu/<arch>/afl-qemu-trace
+  $SUDO apt-get install -y -q --no-install-recommends -o DPkg::Lock::Timeout=900 \
+    ninja-build libglib2.0-dev libpixman-1-dev python3-setuptools bison flex
+  local src="$RE_HOME/src/aflpp"
+  [ -d "$src/.git" ] || { rm -rf "$src"; git clone -q --depth 1 -b "v$AFLPP_VER" https://github.com/AFLplusplus/AFLplusplus "$src"; }
+  make -s -C "$src" -j"$(nproc)" afl-fuzz afl-showmap afl-tmin afl-analyze afl-gotcpu afl-as NO_PYTHON=1
+  for arch in ${AFL_QEMU_ARCHES:-x86_64}; do
+    (cd "$src/qemu_mode" && CPU_TARGET=$arch ./build_qemu_support.sh)
+    mkdir -p "$RE_HOME/afl-qemu/$arch"; cp "$src/afl-qemu-trace" "$RE_HOME/afl-qemu/$arch/afl-qemu-trace"
+    [ -f "$src/libqasan.so" ] && cp "$src/libqasan.so" "$RE_HOME/afl-qemu/$arch/"
+  done
+}
+
 step_node() {
   npm install -g --silent @electron/asar webcrack js-beautify
 }
@@ -235,10 +271,12 @@ run_step node step_node           & P3=$!
 run_step apt step_apt || FAIL=1
 run_step native_tools step_native_tools & P4=$!
 run_step dotnet step_dotnet             & P5=$!
+run_step vuln_tools step_vuln_tools     & P6=$!
 wait $P1 || FAIL=1            # python step wants the pyghidra wheel from Ghidra
 run_step python step_python || FAIL=1
-for p in $P2 $P3 $P4 $P5; do wait "$p" || FAIL=1; done
+for p in $P2 $P3 $P4 $P5 $P6; do wait "$p" || FAIL=1; done
 if [ $WITH_WINE -eq 1 ] || [ "$ONLY" = wine ]; then run_step wine step_wine || FAIL=1; fi
+if [ $WITH_AFL_QEMU -eq 1 ] || [ "$ONLY" = afl_qemu ]; then run_step afl_qemu step_afl_qemu || FAIL=1; fi
 run_step links step_links || FAIL=1
 
 if [ -z "$ONLY" ]; then

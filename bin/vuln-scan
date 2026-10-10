@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Bug-bounty first pass: rank vulnerability LEADS in a target (static only; never runs it, never touches the network).
+# usage: vuln-scan <file|workdir|dir> [--deep N] [--all-code] [--no-semgrep] [--no-secrets] [--top N] [-o OUTDIR]
+#   file     -> runs re-auto first if ./work/<name> doesn't exist, then scans ./work/<name>
+#   workdir  -> a re-auto output dir (has triage.txt)      dir -> any tree (source code, extracted firmware rootfs, ...);
+#               outputs then go to ./work/<dirname>/vuln (and ghidra-deep/ next to it)
+#   --deep N -> also ghidra-analyze up to N embedded binaries (app JNI .so, firmware web/CGI daemons, iOS executable)
+# Output: <workdir>/vuln/CANDIDATES.md (ranked leads + what to verify), native_sinks.tsv, semgrep.tsv, secrets.tsv,
+#         endpoints.txt, attack_surface.txt, hardening.tsv, candidates.tsv          (skill: re-vulnhunt)
+set -uo pipefail
+RE_HOME=${RE_HOME:-/opt/re}
+TOOLS=$(cd "$(dirname "$(readlink -f "$0")")/../tools" && pwd)
+[ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 2; }
+IN=$(realpath "$1"); shift
+ARGS=(); OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT=$2; shift ;;
+    --deep|--top|--min-score) ARGS+=("$1" "$2"); shift ;;
+    --all-code|--no-semgrep|--no-secrets) ARGS+=("$1") ;;
+    *) echo "bad arg $1"; exit 2 ;;
+  esac; shift
+done
+TARGET=()
+if [ -f "$IN" ]; then
+  W=$(realpath -m "./work/$(basename "$IN")")
+  if [ ! -f "$W/triage.txt" ]; then
+    echo "[vuln-scan] no work dir yet: running re-auto $(basename "$IN") (log: $W/re-auto.log)" >&2
+    mkdir -p "$W"; re-auto "$IN" -o "$W" > "$W/re-auto.log" 2>&1 || echo "[vuln-scan] re-auto had errors (see re-auto.log)" >&2
+  fi
+  TARGET=(--target "$IN")
+elif [ -d "$IN" ]; then
+  W=$IN
+  if [ -f "$W/triage.txt" ]; then
+    T=$(awk '$1=="file"{print $2}' "$W/triage.txt"); [ -n "$T" ] && [ -f "$T" ] && TARGET=(--target "$T")
+  else  # plain tree (source, rootfs): keep our outputs out of it
+    [ -n "$OUT" ] || OUT=./work/$(basename "$IN")/vuln
+  fi
+else
+  echo "not found: $IN"; exit 2
+fi
+[ -n "$OUT" ] && ARGS+=(--out "$(realpath -m "$OUT")")
+echo "[vuln-scan] $W" >&2
+t0=$SECONDS
+"$RE_HOME/venv/bin/python" -I "$TOOLS/vulnscan.py" "$W" "${TARGET[@]}" "${ARGS[@]}"
+rc=$?
+echo "[vuln-scan] done in $((SECONDS-t0))s -> ${OUT:-$W/vuln}/CANDIDATES.md" >&2
+exit $rc

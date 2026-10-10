@@ -1,0 +1,92 @@
+# Bug-bounty oriented rules for recovered Python (py-unpack output). Decompiled code may not parse fully - also grep.
+rules:
+  - id: py-unsafe-deserialization
+    languages: [python]
+    severity: ERROR
+    message: pickle/marshal/yaml(unsafe)/jsonpickle deserialization - RCE if the data is attacker-controlled.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      verify: Source of the bytes (socket, HTTP response, file in a shared/temp dir, cache)?
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+      - pattern: cPickle.loads(...)
+      - pattern: _pickle.loads(...)
+      - pattern: dill.loads(...)
+      - pattern: marshal.loads(...)
+      - pattern: jsonpickle.decode(...)
+      - pattern: yaml.unsafe_load(...)
+      - patterns:
+          - pattern: yaml.load(...)
+          - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+          - pattern-not: yaml.load(..., Loader=SafeLoader, ...)
+          - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+
+  - id: py-command-exec
+    languages: [python]
+    severity: WARNING
+    message: Shell command built from a non-constant string.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      verify: Does network/IPC/file input reach it?
+    patterns:
+      - pattern-either:
+          - pattern: os.system($C)
+          - pattern: os.popen($C, ...)
+          - pattern: subprocess.$F($C, ..., shell=True, ...)
+          - pattern: commands.getoutput($C)
+      - pattern-not: os.system("...")
+      - pattern-not: os.popen("...", ...)
+      - pattern-not: subprocess.$F("...", ..., shell=True, ...)
+
+  - id: py-eval-exec
+    languages: [python]
+    severity: WARNING
+    message: eval/exec on a non-constant value.
+    metadata:
+      cwe: "CWE-95: Eval Injection"
+      verify: Does remote data (config from server, plugin, message) reach it?
+    patterns:
+      - pattern-either:
+          - pattern: eval($X, ...)
+          - pattern: exec($X, ...)
+      - pattern-not: eval("...", ...)
+      - pattern-not: exec("...", ...)
+
+  - id: py-tls-verify-off
+    languages: [python]
+    severity: ERROR
+    message: TLS verification disabled.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      verify: Which endpoint (updates, auth)? MITM of an updater is RCE.
+    pattern-either:
+      - pattern: requests.$M(..., verify=False, ...)
+      - pattern: $S.$M(..., verify=False, ...)
+      - pattern: ssl._create_unverified_context(...)
+      - pattern: $CTX.check_hostname = False
+      - pattern: $CTX.verify_mode = ssl.CERT_NONE
+
+  - id: py-archive-extract-traversal
+    languages: [python]
+    severity: WARNING
+    message: tarfile/zipfile extractall without a filter (path traversal / zip-slip on attacker archives).
+    metadata:
+      cwe: "CWE-22: Path Traversal"
+      verify: Are the archives attacker-supplied (downloads, imports, plugin packages)? Python >= 3.12 with filter="data" is safe.
+    patterns:
+      - pattern: $T.extractall(...)
+      - pattern-not: $T.extractall(..., filter="data", ...)
+
+  - id: py-sql-format
+    languages: [python]
+    severity: WARNING
+    message: SQL built with formatting/concatenation passed to execute().
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      verify: Does attacker input reach the formatted part?
+    pattern-either:
+      - pattern: $C.execute("..." % ..., ...)
+      - pattern: $C.execute("..." + $X, ...)
+      - pattern: $C.execute(f"...", ...)
+      - pattern: $C.execute("...".format(...), ...)

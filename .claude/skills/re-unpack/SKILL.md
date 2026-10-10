@@ -30,6 +30,9 @@ Signs of packing: section entropy H>7.2, few imports (LoadLibrary/GetProcAddress
 | Squashfs / firmware | `binwalk -e FILE` (`-Me` recursive), `unsquashfs` |
 | Android backup/OTA, misc | `binwalk FILE` to locate, `dd`/`repy` to carve |
 After extracting, run `re-triage` on the biggest or most interesting members (`find OUT -type f -size +100k | xargs file`).
+Extracted a firmware rootfs (has `etc/`, `bin/busybox`)? `vuln-scan <rootfs> --deep 6` finds password hashes, boot-time
+services, web/CGI binaries with input→`system` imports, and bundled component versions, and decompiles the top daemons
+(skill re-vulnhunt).
 
 ## Electron / Node
 - Find `resources/app.asar` (in the install directory or inside the installer, e.g. NSIS `$PLUGINSDIR/app-64.7z`).

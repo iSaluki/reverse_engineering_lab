@@ -18,6 +18,8 @@ Layout: `jadx/sources/` (Java), `jadx/resources/` (AndroidManifest.xml, res/valu
 `apktool/` (smali + raw resources), `native/<abi>/*.so`, `hermes/`, `js/`.
 
 ## Finding things fast
+Bug hunting? `vuln-scan app.apk` ranks exported-component, WebView, intent, provider, crypto and secret leads
+(skill re-vulnhunt). The greps below are for manual digging.
 ```bash
 A=work/app.apk/apk; SRC=$A/jadx/sources/<pkg/path from summary>
 rg -l 'SecretKeySpec|Cipher.getInstance|MessageDigest' $A/jadx/sources | rg -v '^.*/(androidx|kotlin|com/google)/' | head
